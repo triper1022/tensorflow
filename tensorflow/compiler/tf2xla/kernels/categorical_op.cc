@@ -36,7 +36,9 @@ namespace {
 
 class CategoricalOp : public XlaOpKernel {
  public:
-  explicit CategoricalOp(OpKernelConstruction* ctx) : XlaOpKernel(ctx) {}
+  explicit CategoricalOp(OpKernelConstruction* ctx)
+      : XlaOpKernel(ctx),
+        is_gpu_(ctx->device_type().type_string() == DEVICE_GPU_XLA_JIT) {}
 
   void Compile(XlaOpKernelContext* ctx) override {
     // Get the logits
@@ -89,6 +91,13 @@ class CategoricalOp : public XlaOpKernel {
     xla::PrimitiveType type;
     OP_REQUIRES_OK(ctx, DataTypeToPrimitiveType(input_type(0), &type));
     xla::XlaOp log_uniforms = GetLogUniforms(uniform_shape, type, ctx);
+    bool num_samples_is_dynamic = false;
+    OP_REQUIRES_OK(
+        ctx, ctx->ResolveInputDynamismIntoPred(1, &num_samples_is_dynamic));
+    if (num_samples_is_dynamic && num_samples != 1) {
+      // Number samples is dimension 1 in uniform_shape_array.
+      log_uniforms = xla::SetDimensionSize(log_uniforms, ctx->Input(1), 1);
+    }
 
     // Use Gumbel softmax trick to generate categorical samples.
     // See:
@@ -101,8 +110,15 @@ class CategoricalOp : public XlaOpKernel {
     xla::PrimitiveType xla_output_type;
     OP_REQUIRES_OK(ctx,
                    DataTypeToPrimitiveType(output_type(0), &xla_output_type));
-    xla::XlaOp argmax = xla::ArgMax(softmax_entries, xla_output_type,
-                                    /*axis=*/class_dimension);
+    xla::XlaOp argmax;
+    if (is_gpu_) {
+      argmax = xla::ArgMaxTwoPass(softmax_entries, xla_output_type,
+                                  /*axis=*/class_dimension);
+    } else {
+      argmax = xla::ArgMax(softmax_entries, xla_output_type,
+                           /*axis=*/class_dimension, /*stable=*/true);
+    }
+
     if (num_samples == 1) {
       argmax = xla::Reshape(argmax, {batch_size, 1});
     }
@@ -114,6 +130,8 @@ class CategoricalOp : public XlaOpKernel {
                                     xla::PrimitiveType type,
                                     XlaOpKernelContext* ctx) {
     xla::XlaBuilder* builder = ctx->builder();
+    LOG_FIRST_N(WARNING, 1) << "Warning: Using tf.random.categorical with XLA"
+                               " compilation will ignore seeds.";
     // We want a number in (0, 1) rather than [0, 1) or (0, 1]:
     // * log(-log(0)) is ∞.
     // * log(-log(1)) is -∞.
@@ -124,6 +142,7 @@ class CategoricalOp : public XlaOpKernel {
   }
 
  private:
+  bool is_gpu_;
   TF_DISALLOW_COPY_AND_ASSIGN(CategoricalOp);
 };
 
@@ -134,7 +153,8 @@ REGISTER_XLA_OP(Name("Multinomial").CompileTimeConstantInput("num_samples"),
 class StatelessCategoricalOp : public CategoricalOp {
  public:
   explicit StatelessCategoricalOp(OpKernelConstruction* ctx)
-      : CategoricalOp(ctx) {
+      : CategoricalOp(ctx),
+        device_type_string_(ctx->device_type().type_string()) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("T", &dtype_));
   }
 
@@ -150,7 +170,7 @@ class StatelessCategoricalOp : public CategoricalOp {
     // * log(-log(0)) is ∞.
     // * log(-log(1)) is -∞.
     xla::XlaOp uniforms = StatelessRngUniform(
-        seed, uniform_shape,
+        device_type_string_, seed, uniform_shape,
         xla::MinPositiveNormalValue(builder, uniform_shape.element_type()),
         xla::One(builder, uniform_shape.element_type()));
     return xla::ConvertElementType(xla::Log(-xla::Log(uniforms)), type);
@@ -166,13 +186,14 @@ class StatelessCategoricalOp : public CategoricalOp {
 
  private:
   DataType dtype_;
+  string device_type_string_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(StatelessCategoricalOp);
 };
 
 REGISTER_XLA_OP(Name("StatelessMultinomial")
                     .CompileTimeConstantInput("num_samples")
-                    .TypeConstraint("T", {DT_FLOAT, DT_BFLOAT16})
+                    .TypeConstraint("T", {DT_DOUBLE, DT_FLOAT, DT_BFLOAT16})
                     .TypeConstraint("Tseed", DT_INT32),
                 StatelessCategoricalOp);
 

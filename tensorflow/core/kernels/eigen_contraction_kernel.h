@@ -40,8 +40,10 @@ limitations under the License.
 // clang-format on
 
 #if defined(TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL)
-#include "mkldnn.h"
+#include "dnnl.h"
 #endif
+
+#include "tensorflow/core/platform/dynamic_annotations.h"
 
 namespace Eigen {
 namespace internal {
@@ -49,7 +51,7 @@ namespace internal {
 #if defined(TENSORFLOW_USE_CUSTOM_CONTRACTION_KERNEL)
 // Returns `true` iff we can use custom contraction kernels. This is a runtime
 // check, that uses environment variables.
-bool UseCustomContractionKernels();
+EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE bool UseCustomContractionKernels();
 
 // Pack a 2D block of a Tensor expression into contiguous block of memory with
 // col-major storage order. We do not have access to the underlying Tensor
@@ -123,23 +125,27 @@ struct gemm_pack_colmajor_block<Scalar, IndexType, DataMapper,
 
 template <typename Scalar, typename IndexType, typename OutputMapper,
           bool ConjugateLhs = false, bool ConjugateRhs = false>
-struct mkldnn_gemm_kernel;
+struct dnnl_gemm_kernel;
 
-// mkldnn_gemm_kernel for floats defined as a thin layer on top of mkldnn_sgemm.
+// dnnl_gemm_kernel for floats defined as a thin layer on top of mkldnn_sgemm.
 template <typename IndexType, typename OutputMapper, bool ConjugateLhs,
           bool ConjugateRhs>
-struct mkldnn_gemm_kernel</*Scalar*/ float, IndexType, OutputMapper,
-                          ConjugateLhs, ConjugateRhs> {
-  static_assert(!ConjugateLhs, "MKL-DNN kernel doesn't support ConjugateLhs");
-  static_assert(!ConjugateRhs, "MKL-DNN kernel doesn't support ConjugateRhs");
+struct dnnl_gemm_kernel</*Scalar*/ float, IndexType, OutputMapper, ConjugateLhs,
+                        ConjugateRhs> {
+  static_assert(!ConjugateLhs, "DNNL kernel doesn't support ConjugateLhs");
+  static_assert(!ConjugateRhs, "DNNL kernel doesn't support ConjugateRhs");
 
   static constexpr int kComputeStrideFromBlockDimensions = -1;
 
+  using LhsScalar = float;
+  using RhsScalar = float;
+  using ResScalar = float;
+
   EIGEN_DONT_INLINE
-  void operator()(const OutputMapper& output, const float* blockA,
-                  const float* blockB, const IndexType rows,
+  void operator()(const OutputMapper& output, const LhsScalar* blockA,
+                  const RhsScalar* blockB, const IndexType rows,
                   const IndexType depth, const IndexType cols, float alpha,
-                  int ldA = kComputeStrideFromBlockDimensions,
+                  float beta, int ldA = kComputeStrideFromBlockDimensions,
                   int ldB = kComputeStrideFromBlockDimensions,
                   char transposeA = 'N', char transposeB = 'N') {
     static const int max_index = (std::numeric_limits<int>::max)();
@@ -157,12 +163,25 @@ struct mkldnn_gemm_kernel</*Scalar*/ float, IndexType, OutputMapper,
     ldB = ldB == kComputeStrideFromBlockDimensions ? k : ldB;
     const int ldC = static_cast<int>(output.stride());
 
-    const float beta = 1.0;
-
-    mkldnn_status_t st = mkldnn_sgemm(&transposeA, &transposeB, &m, &n, &k,
-                                      &alpha, blockA, &ldA, blockB, &ldB, &beta,
-                                      const_cast<float*>(output.data()), &ldC);
+    // DNNL takes row-major matrices. Our packed column-major matrices can be
+    // viewed as a transposed row-major matrix, i.e.,
+    //   C_colmajor = C_rowmajor^T = (A_rowmajor * B_rowmajor)^T
+    //                             = B_rowmajor^T * A_rowmajor^T
+    //                             = B_colmajor * A_colmajor
+    // So we can just swap the input matrices A and B for DNNL.
+    // TODO(penporn): Switch to row-major packing instead.
+    dnnl_status_t st =
+        dnnl_sgemm(transposeB, transposeA, n, m, k, alpha, blockB, ldB, blockA,
+                   ldA, beta, const_cast<ResScalar*>(output.data()), ldC);
     eigen_assert(st == 0);
+
+#if DYNAMIC_ANNOTATIONS_ENABLED == 1 || defined(MEMORY_SANITIZER)
+    for (IndexType col = 0; col < cols; ++col) {
+      ResScalar* row_base = &output(0, col);
+      EIGEN_UNUSED_VARIABLE(row_base);  // Suppress unused variable error.
+      TF_ANNOTATE_MEMORY_IS_INITIALIZED(row_base, sizeof(ResScalar) * rows);
+    }
+#endif
 
     // eigen_assert is a no-op in optimized mode so we add these to avoid
     // compiler's unused-variable errors.
@@ -173,21 +192,21 @@ struct mkldnn_gemm_kernel</*Scalar*/ float, IndexType, OutputMapper,
 
 template <typename IndexType, typename OutputMapper, bool ConjugateLhs = false,
           bool ConjugateRhs = false>
-struct mkldnn_gemm_s8s8s32_kernel {
-  static_assert(!ConjugateLhs, "MKL-DNN kernel doesn't support ConjugateLhs");
-  static_assert(!ConjugateRhs, "MKL-DNN kernel doesn't support ConjugateRhs");
+struct mkldnn_gemm_s8u8s32_kernel {
+  static_assert(!ConjugateLhs, "DNNL kernel doesn't support ConjugateLhs");
+  static_assert(!ConjugateRhs, "DNNL kernel doesn't support ConjugateRhs");
 
   static constexpr int kComputeStrideFromBlockDimensions = -1;
 
   using LhsScalar = Eigen::QInt8;
-  using RhsScalar = Eigen::QInt8;
+  using RhsScalar = Eigen::QUInt8;
   using ResScalar = Eigen::QInt32;
 
   EIGEN_DONT_INLINE
   void operator()(const OutputMapper& output, const LhsScalar* blockA,
                   const RhsScalar* blockB, const IndexType rows,
                   const IndexType depth, const IndexType cols, float alpha,
-                  int ldA = kComputeStrideFromBlockDimensions,
+                  float beta, int ldA = kComputeStrideFromBlockDimensions,
                   int ldB = kComputeStrideFromBlockDimensions,
                   char transposeA = 'N', char transposeB = 'N') {
     static const int max_index = (std::numeric_limits<int>::max)();
@@ -205,8 +224,6 @@ struct mkldnn_gemm_s8s8s32_kernel {
     ldB = ldB == kComputeStrideFromBlockDimensions ? k : ldB;
     const int ldC = static_cast<int>(output.stride());
 
-    const float beta = 1.0;
-
     // Currently we support only symmetric quantization with zero point at 0.
     const int8_t ao = 0;
     const int8_t bo = 0;
@@ -215,20 +232,33 @@ struct mkldnn_gemm_s8s8s32_kernel {
     const char offsetc = 'F';
     const int32_t co = 0;
 
-    const int8_t* A = reinterpret_cast<const int8_t*>(blockA);
-    const int8_t* B = reinterpret_cast<const int8_t*>(blockB);
-    int32_t* C =
-        reinterpret_cast<int32_t*>(const_cast<ResScalar*>(output.data()));
+    const auto* A = reinterpret_cast<const int8_t*>(blockA);
+    const auto* B = reinterpret_cast<const uint8_t*>(blockB);
+    auto* C = reinterpret_cast<int32_t*>(const_cast<ResScalar*>(output.data()));
 
-    mkldnn_status_t st =
-        mkldnn_gemm_s8s8s32(&transposeA, &transposeB, &offsetc,  //
-                            &m, &n, &k,                          //
-                            &alpha,                              //
-                            A, &ldA, &ao,                        //
-                            B, &ldB, &bo,                        //
-                            &beta,                               //
-                            C, &ldC, &co);
+    // DNNL takes row-major matrices. Our packed column-major matrices can be
+    // viewed as a transposed row-major matrix, i.e., C_colmajor = C_rowmajor^T.
+    // C_colmajor = C_rowmajor^T = (A_rowmajor * B_rowmajor)^T
+    //                           = B_rowmajor^T * A_rowmajor^T
+    //                           = B_colmajor * A_colmajor
+    // So we can just swap the input matrices A and B for DNNL.
+    // TODO(penporn): Switch to row-major packing instead.
+    dnnl_status_t st = dnnl_gemm_u8s8s32(transposeB, transposeA, offsetc,  //
+                                         n, m, k,                          //
+                                         alpha,                            //
+                                         B, ldB, bo,                       //
+                                         A, ldA, ao,                       //
+                                         beta,                             //
+                                         C, ldC, &co);
     eigen_assert(st == 0);
+
+#if DYNAMIC_ANNOTATIONS_ENABLED == 1 || defined(MEMORY_SANITIZER)
+    for (IndexType col = 0; col < cols; ++col) {
+      ResScalar* row_base = &output(0, col);
+      EIGEN_UNUSED_VARIABLE(row_base);  // Suppress unused variable error.
+      TF_ANNOTATE_MEMORY_IS_INITIALIZED(row_base, sizeof(ResScalar) * rows);
+    }
+#endif
 
     // eigen_assert is a no-op in optimized mode so we add these to avoid
     // compiler's unused-variable errors.
@@ -255,10 +285,10 @@ class TensorContractionBlocking<float, float, float, StorageIndex,
   static constexpr float kScaleN = 1.0;
 
   // Mkldnn Avx/Avx2/Avx512 unroll factors are: 8/16/48.
-  static const StorageIndex kUnrollM = 48;
+  static constexpr StorageIndex kUnrollM = 48;
 
   // Mkldnn Avx/Avx2/Avx512 unroll factors are: 6/6/8.
-  static const StorageIndex kUnrollN = 24;
+  static constexpr StorageIndex kUnrollN = 24;
 
  public:
   TensorContractionBlocking(StorageIndex k, StorageIndex m, StorageIndex n,
@@ -277,7 +307,7 @@ class TensorContractionBlocking<float, float, float, StorageIndex,
     if (kc_ <= 0 || mc_ <= 0 || nc_ <= 0) return;
 
     // If we are using default Eigen gebp kernel there is no need to adjust the
-    // block sizes for MKL-DNN.
+    // block sizes for DNNL.
     if (!UseCustomContractionKernels()) return;
 
     // 2. And refine them to work well with mkldnn sgemm.
@@ -296,6 +326,44 @@ class TensorContractionBlocking<float, float, float, StorageIndex,
     StorageIndex target_bk =
         Eigen::divup(k / target_k_slices, packet_size) * packet_size;
     kc_ = (std::min)(k, target_bk);
+  }
+
+  EIGEN_ALWAYS_INLINE StorageIndex kc() const { return kc_; }
+  EIGEN_ALWAYS_INLINE StorageIndex mc() const { return mc_; }
+  EIGEN_ALWAYS_INLINE StorageIndex nc() const { return nc_; }
+
+ private:
+  StorageIndex kc_;
+  StorageIndex mc_;
+  StorageIndex nc_;
+};
+
+template <typename StorageIndex, int sharding_type>
+class TensorContractionBlocking<Eigen::QInt32, Eigen::QInt8, Eigen::QUInt8,
+                                StorageIndex, sharding_type> {
+  // TODO(ezhulenev): Define proper gebp_traits in Eigen for quantized types?
+
+  // Default Eigen block heuristics for `QInt8xQUInt8 -> QInt32` are wrong.
+  // Mostly because gebp_traits are not correctly defined. But we know that we
+  // are going to use s8u8s32_gemm from DNNL, so we use float heuristics, and
+  // adjust them to work well with DNNL.
+  using LhsScalar = Eigen::QInt8;
+  using RhsScalar = Eigen::QUInt8;
+  using ResScalar = Eigen::QInt32;
+
+  // Multiply default choice of block size along M, N and K dimensions.
+  static constexpr float kScaleM = 1.5;
+  static constexpr float kScaleN = 1.5;
+  static constexpr float kScaleK = 1.5;
+
+ public:
+  TensorContractionBlocking(StorageIndex k, StorageIndex m, StorageIndex n,
+                            StorageIndex num_threads = 1)
+      : kc_(k), mc_(m), nc_(n) {
+    // Each dimension is a multiple of 32 (fits into _m256i).
+    mc_ = (std::min)(m, static_cast<StorageIndex>(192));
+    nc_ = (std::min)(n, static_cast<StorageIndex>(288));
+    kc_ = (std::min)(k, static_cast<StorageIndex>(320));
   }
 
   EIGEN_ALWAYS_INLINE StorageIndex kc() const { return kc_; }
@@ -378,10 +446,11 @@ struct DirectColMajorAccess {
       data = Side == Lhs ? data : data + vert_offset + horiz_offset * stride;  \
                                                                                \
       const bool is_no_op_packing = stride == rows;                            \
-      const StorageIndex adressable_mem = (stride * cols * sizeof(Scalar));    \
+      const StorageIndex addressable_mem = (stride * cols * sizeof(Scalar));   \
       const bool use_direct_access =                                           \
           is_no_op_packing || num_kernels == 1 /* used once */ ||              \
-          ((num_kernels == 2) && (adressable_mem < (256 << 10) /* 256 kb */)); \
+          ((num_kernels == 2) &&                                               \
+           (addressable_mem < (256 << 10) /* 256 kb */));                      \
                                                                                \
       if (use_direct_access) {                                                 \
         block->is_direct_access = true;                                        \
@@ -444,20 +513,22 @@ struct GemmKernelProvider {
 template <typename StorageIndex, typename OutputMapper>
 struct GemmKernelProvider<float, float, float, StorageIndex, OutputMapper> {
   enum { Defined = 1 };
-  using GemmKernel = mkldnn_gemm_kernel<float, StorageIndex, OutputMapper>;
+  using GemmKernel = dnnl_gemm_kernel<float, StorageIndex, OutputMapper>;
 };
 
 template <typename StorageIndex, typename OutputMapper>
-struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QInt8,
+struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QUInt8,
                           StorageIndex, OutputMapper> {
   enum { Defined = 1 };
-  using GemmKernel = mkldnn_gemm_s8s8s32_kernel<StorageIndex, OutputMapper>;
+  using GemmKernel = mkldnn_gemm_s8u8s32_kernel<StorageIndex, OutputMapper>;
 };
 
 // NOTE: 'std::enable_if' doesn't work for template specializations. See
 // "default template argument in a class template partial specialization".
 
-#define REGISTER_TENSOR_CONTRACTION_KERNEL(RES_SCALAR, LHS_SCALAR, RHS_SCALAR) \
+// Tensor contraction kernel that can fallback on Eigen gebp_kernel at runtime.
+#define REGISTER_TENSOR_CONTRACTION_KERNEL_WITH_FALLBACK(                      \
+    RES_SCALAR, LHS_SCALAR, RHS_SCALAR)                                        \
                                                                                \
   template <typename StorageIndex, typename OutputMapper, typename LhsMapper,  \
             typename RhsMapper>                                                \
@@ -466,14 +537,9 @@ struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QInt8,
                                  RhsMapper> {                                  \
     TensorContractionKernel(StorageIndex m, StorageIndex k, StorageIndex n,    \
                             StorageIndex bm, StorageIndex bk, StorageIndex bn) \
-        : m(m),                                                                \
-          k(k),                                                                \
-          n(n),                                                                \
-          bm(bm),                                                              \
-          bk(bk),                                                              \
-          bn(bn),                                                              \
-          nm0(bm > 0 ? divup(m, bm) : 0),                                      \
-          nn0(bn > 0 ? divup(n, bn) : 0) {}                                    \
+        : m(m), k(k), n(n), bm(bm), bk(bk), bn(bn) {}                          \
+                                                                               \
+    enum { HasBeta = true };                                                   \
                                                                                \
     using ResScalar = RES_SCALAR;                                              \
     using LhsScalar = LHS_SCALAR;                                              \
@@ -556,7 +622,8 @@ struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QInt8,
     }                                                                          \
                                                                                \
     template <typename Device>                                                 \
-    EIGEN_DEVICE_FUNC void deallocate(Device& d, BlockMemHandle handle) {      \
+    EIGEN_DEVICE_FUNC static void deallocate(Device& d,                        \
+                                             BlockMemHandle handle) {          \
       BlockMemAllocator::deallocate(d, handle);                                \
     }                                                                          \
                                                                                \
@@ -566,7 +633,8 @@ struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QInt8,
       if (UseCustomContractionKernels()) {                                     \
         const bool is_direct_access =                                          \
             DirectLhsAccess::value &&                                          \
-            DirectLhsAccess::block(data_mapper, rows, depth, nn0, lhsBlock);   \
+            DirectLhsAccess::block(data_mapper, rows, depth,                   \
+                                   bn > 0 ? divup(n, bn) : 0, lhsBlock);       \
                                                                                \
         if (!is_direct_access) {                                               \
           lhsBlock->is_direct_access = false;                                  \
@@ -585,7 +653,8 @@ struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QInt8,
       if (UseCustomContractionKernels()) {                                     \
         const bool is_direct_access =                                          \
             DirectRhsAccess::value &&                                          \
-            DirectRhsAccess::block(data_mapper, depth, cols, nm0, rhsBlock);   \
+            DirectRhsAccess::block(data_mapper, depth, cols,                   \
+                                   bm > 0 ? divup(m, bm) : 0, rhsBlock);       \
                                                                                \
         if (!is_direct_access) {                                               \
           rhsBlock->is_direct_access = false;                                  \
@@ -600,35 +669,50 @@ struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QInt8,
     EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE void invoke(                           \
         const OutputMapper& output_mapper, const LhsBlock& lhsBlock,           \
         const RhsBlock& rhsBlock, const StorageIndex rows,                     \
-        const StorageIndex depth, const StorageIndex cols,                     \
-        const float alpha) {                                                   \
+        const StorageIndex depth, const StorageIndex cols, const float alpha,  \
+        const float beta) {                                                    \
       if (UseCustomContractionKernels()) {                                     \
         if ((DirectLhsAccess::value && lhsBlock.is_direct_access) &&           \
             (DirectRhsAccess::value && rhsBlock.is_direct_access)) {           \
           GemmKernel()(output_mapper, lhsBlock.raw_data, rhsBlock.raw_data,    \
-                       rows, depth, cols, alpha, /*ldA=*/lhsBlock.stride,      \
-                       /*ldB=*/rhsBlock.stride,                                \
+                       rows, depth, cols, alpha, beta,                         \
+                       /*ldA=*/lhsBlock.stride, /*ldB=*/rhsBlock.stride,       \
                        /*transposeA=*/lhsBlock.transpose,                      \
                        /*transposeB=*/rhsBlock.transpose);                     \
                                                                                \
         } else if (DirectLhsAccess::value && lhsBlock.is_direct_access) {      \
           GemmKernel()(output_mapper, lhsBlock.raw_data, rhsBlock.packed_data, \
-                       rows, depth, cols, alpha, /*ldA=*/lhsBlock.stride,      \
+                       rows, depth, cols, alpha, beta,                         \
+                       /*ldA=*/lhsBlock.stride,                                \
                        /*ldB=*/GemmKernel::kComputeStrideFromBlockDimensions,  \
                        /*transposeA=*/lhsBlock.transpose, /*transposeB=*/'N'); \
                                                                                \
         } else if (DirectRhsAccess::value && rhsBlock.is_direct_access) {      \
           GemmKernel()(output_mapper, lhsBlock.packed_data, rhsBlock.raw_data, \
-                       rows, depth, cols, alpha,                               \
+                       rows, depth, cols, alpha, beta,                         \
                        /*ldA=*/GemmKernel::kComputeStrideFromBlockDimensions,  \
                        /*ldB=*/rhsBlock.stride, /*transposeA=*/'N',            \
                        /*transposeB=*/rhsBlock.transpose);                     \
                                                                                \
         } else {                                                               \
           GemmKernel()(output_mapper, lhsBlock.packed_data,                    \
-                       rhsBlock.packed_data, rows, depth, cols, alpha);        \
+                       rhsBlock.packed_data, rows, depth, cols, alpha, beta);  \
         }                                                                      \
       } else {                                                                 \
+        /* Gebp kernel does not support beta, so we have to clear memory in */ \
+        /* the output mapper manually.                                      */ \
+        /* WARNING(ezhulenev): This is optimized into a memset in a loop,   */ \
+        /* could be much slower for small matrices. Currently this code     */ \
+        /* path used only for testing, and performance does not matter.     */ \
+        if (beta == 0.0) {                                                     \
+          for (StorageIndex col = 0; col < cols; ++col) {                      \
+            ResScalar* output_base = &output_mapper(0, col);                   \
+            typedef Array<ResScalar, Dynamic, 1> OutputRow;                    \
+            typedef Map<OutputRow, 0, InnerStride<1>> OutputRowMap;            \
+            OutputRowMap(output_base, rows).setZero();                         \
+          }                                                                    \
+        }                                                                      \
+                                                                               \
         GebpKernel()(                                                          \
             output_mapper, lhsBlock.packed_data, rhsBlock.packed_data, rows,   \
             depth, cols, alpha,                                                \
@@ -648,13 +732,171 @@ struct GemmKernelProvider<Eigen::QInt32, Eigen::QInt8, Eigen::QInt8,
     const StorageIndex bm;                                                     \
     const StorageIndex bk;                                                     \
     const StorageIndex bn;                                                     \
-    /* Number of kernels for each dimension. */                                \
-    const StorageIndex nm0;                                                    \
-    const StorageIndex nn0;                                                    \
   }
 
-REGISTER_TENSOR_CONTRACTION_KERNEL(float, float, float);
-REGISTER_TENSOR_CONTRACTION_KERNEL(Eigen::QInt32, Eigen::QInt8, Eigen::QInt8);
+// Tensor contraction kernel that do not fallback on Eigen. Currently not all
+// data types are supported by Eigen data packing and default gebp_kernel.
+#define REGISTER_TENSOR_CONTRACTION_KERNEL_NO_FALLBACK(RES_SCALAR, LHS_SCALAR, \
+                                                       RHS_SCALAR)             \
+                                                                               \
+  template <typename StorageIndex, typename OutputMapper, typename LhsMapper,  \
+            typename RhsMapper>                                                \
+  struct TensorContractionKernel<RES_SCALAR, LHS_SCALAR, RHS_SCALAR,           \
+                                 StorageIndex, OutputMapper, LhsMapper,        \
+                                 RhsMapper> {                                  \
+    TensorContractionKernel(StorageIndex m, StorageIndex k, StorageIndex n,    \
+                            StorageIndex bm, StorageIndex bk, StorageIndex bn) \
+        : m(m), k(k), n(n), bm(bm), bk(bk), bn(bn) {}                          \
+                                                                               \
+    enum { HasBeta = true };                                                   \
+                                                                               \
+    using ResScalar = RES_SCALAR;                                              \
+    using LhsScalar = LHS_SCALAR;                                              \
+    using RhsScalar = RHS_SCALAR;                                              \
+                                                                               \
+    using Traits = typename internal::gebp_traits<LhsScalar, RhsScalar>;       \
+                                                                               \
+    using LhsBlock = ColMajorBlock<LhsScalar, StorageIndex>;                   \
+    using RhsBlock = ColMajorBlock<RhsScalar, StorageIndex>;                   \
+                                                                               \
+    using DirectLhsAccess = DirectColMajorAccess<LhsMapper>;                   \
+    using DirectRhsAccess = DirectColMajorAccess<RhsMapper>;                   \
+                                                                               \
+    /* Packed Lhs/Rhs block memory allocator.*/                                \
+    typedef TensorContractionBlockMemAllocator<LhsScalar, RhsScalar>           \
+        BlockMemAllocator;                                                     \
+    typedef typename BlockMemAllocator::BlockMemHandle BlockMemHandle;         \
+                                                                               \
+    using LhsPacker =                                                          \
+        gemm_pack_colmajor_block<LhsScalar, StorageIndex,                      \
+                                 typename LhsMapper::SubMapper, ColMajor>;     \
+    using RhsPacker =                                                          \
+        gemm_pack_colmajor_block<RhsScalar, StorageIndex,                      \
+                                 typename RhsMapper::SubMapper, ColMajor>;     \
+                                                                               \
+    using GemmKernelProviderType =                                             \
+        GemmKernelProvider<ResScalar, LhsScalar, RhsScalar, StorageIndex,      \
+                           OutputMapper>;                                      \
+    static_assert(                                                             \
+        GemmKernelProviderType::Defined,                                       \
+        "Custom GEMM kernel is not registered for given scalar types");        \
+    using GemmKernel = typename GemmKernelProviderType::GemmKernel;            \
+                                                                               \
+    template <typename Device>                                                 \
+    EIGEN_DEVICE_FUNC BlockMemHandle allocate(Device& d, LhsBlock* lhs_block,  \
+                                              RhsBlock* rhs_block) {           \
+      return BlockMemAllocator::allocate(                                      \
+          d, bm, bk, bn, &lhs_block->packed_data, &rhs_block->packed_data);    \
+    }                                                                          \
+                                                                               \
+    template <typename Device>                                                 \
+    EIGEN_DEVICE_FUNC BlockMemHandle                                           \
+    allocateSlices(Device& d, const int num_lhs, const int num_rhs,            \
+                   const int num_slices, std::vector<LhsBlock>* lhs_blocks,    \
+                   std::vector<RhsBlock>* rhs_blocks) {                        \
+      eigen_assert(num_slices > 0);                                            \
+      std::vector<std::vector<LhsScalar*>> lhs_mem(num_slices);                \
+      std::vector<std::vector<RhsScalar*>> rhs_mem(num_slices);                \
+                                                                               \
+      BlockMemHandle block_mem = BlockMemAllocator::allocateSlices(            \
+          d, bm, bk, bn, num_lhs, num_rhs, num_slices, lhs_mem.data(),         \
+          rhs_mem.data());                                                     \
+                                                                               \
+      for (Index x = 0; x < num_slices; x++) {                                 \
+        if (num_lhs > 0) lhs_blocks[x].resize(num_lhs);                        \
+        for (Index m = 0; m < num_lhs; m++) {                                  \
+          lhs_blocks[x][m].packed_data = lhs_mem[x][m];                        \
+        }                                                                      \
+        if (num_rhs > 0) rhs_blocks[x].resize(num_rhs);                        \
+        for (Index n = 0; n < num_rhs; n++) {                                  \
+          rhs_blocks[x][n].packed_data = rhs_mem[x][n];                        \
+        }                                                                      \
+      }                                                                        \
+                                                                               \
+      return block_mem;                                                        \
+    }                                                                          \
+                                                                               \
+    template <typename Device>                                                 \
+    EIGEN_DEVICE_FUNC static void deallocate(Device& d,                        \
+                                             BlockMemHandle handle) {          \
+      BlockMemAllocator::deallocate(d, handle);                                \
+    }                                                                          \
+                                                                               \
+    EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE void packLhs(                          \
+        LhsBlock* lhsBlock, const typename LhsMapper::SubMapper& data_mapper,  \
+        const StorageIndex depth, const StorageIndex rows) {                   \
+      const bool is_direct_access =                                            \
+          DirectLhsAccess::value &&                                            \
+          DirectLhsAccess::block(data_mapper, rows, depth,                     \
+                                 bn > 0 ? divup(n, bn) : 0, lhsBlock);         \
+                                                                               \
+      if (!is_direct_access) {                                                 \
+        lhsBlock->is_direct_access = false;                                    \
+        LhsPacker()(lhsBlock->packed_data, data_mapper, rows, depth);          \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE void packRhs(                          \
+        RhsBlock* rhsBlock, const typename RhsMapper::SubMapper& data_mapper,  \
+        const StorageIndex depth, const StorageIndex cols) {                   \
+      const bool is_direct_access =                                            \
+          DirectRhsAccess::value &&                                            \
+          DirectRhsAccess::block(data_mapper, depth, cols,                     \
+                                 bm > 0 ? divup(m, bm) : 0, rhsBlock);         \
+                                                                               \
+      if (!is_direct_access) {                                                 \
+        rhsBlock->is_direct_access = false;                                    \
+        RhsPacker()(rhsBlock->packed_data, data_mapper, depth, cols);          \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    EIGEN_DEVICE_FUNC EIGEN_DONT_INLINE void invoke(                           \
+        const OutputMapper& output_mapper, const LhsBlock& lhsBlock,           \
+        const RhsBlock& rhsBlock, const StorageIndex rows,                     \
+        const StorageIndex depth, const StorageIndex cols, const float alpha,  \
+        const float beta) {                                                    \
+      if ((DirectLhsAccess::value && lhsBlock.is_direct_access) &&             \
+          (DirectRhsAccess::value && rhsBlock.is_direct_access)) {             \
+        GemmKernel()(output_mapper, lhsBlock.raw_data, rhsBlock.raw_data,      \
+                     rows, depth, cols, alpha, beta, /*ldA=*/lhsBlock.stride,  \
+                     /*ldB=*/rhsBlock.stride,                                  \
+                     /*transposeA=*/lhsBlock.transpose,                        \
+                     /*transposeB=*/rhsBlock.transpose);                       \
+                                                                               \
+      } else if (DirectLhsAccess::value && lhsBlock.is_direct_access) {        \
+        GemmKernel()(output_mapper, lhsBlock.raw_data, rhsBlock.packed_data,   \
+                     rows, depth, cols, alpha, beta, /*ldA=*/lhsBlock.stride,  \
+                     /*ldB=*/GemmKernel::kComputeStrideFromBlockDimensions,    \
+                     /*transposeA=*/lhsBlock.transpose, /*transposeB=*/'N');   \
+                                                                               \
+      } else if (DirectRhsAccess::value && rhsBlock.is_direct_access) {        \
+        GemmKernel()(output_mapper, lhsBlock.packed_data, rhsBlock.raw_data,   \
+                     rows, depth, cols, alpha, beta,                           \
+                     /*ldA=*/GemmKernel::kComputeStrideFromBlockDimensions,    \
+                     /*ldB=*/rhsBlock.stride, /*transposeA=*/'N',              \
+                     /*transposeB=*/rhsBlock.transpose);                       \
+                                                                               \
+      } else {                                                                 \
+        GemmKernel()(output_mapper, lhsBlock.packed_data,                      \
+                     rhsBlock.packed_data, rows, depth, cols, alpha, beta);    \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+   private:                                                                    \
+    /* These are dimensions of the original Tensors, and selected block     */ \
+    /* sizes. The actual block sizes passed to all function above might be  */ \
+    /* smaller because of the partial blocks at the end.                    */ \
+    const StorageIndex m;                                                      \
+    const StorageIndex k;                                                      \
+    const StorageIndex n;                                                      \
+    const StorageIndex bm;                                                     \
+    const StorageIndex bk;                                                     \
+    const StorageIndex bn;                                                     \
+  }
+
+REGISTER_TENSOR_CONTRACTION_KERNEL_WITH_FALLBACK(float, float, float);
+REGISTER_TENSOR_CONTRACTION_KERNEL_NO_FALLBACK(Eigen::QInt32, Eigen::QInt8,
+                                               Eigen::QUInt8);
 
 #undef REGISTER_TENSOR_CONTRACTION_KERNEL
 

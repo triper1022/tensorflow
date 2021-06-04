@@ -27,7 +27,6 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "tensorflow/compiler/xla/service/compiler.h"
 #include "tensorflow/compiler/xla/service/computation_placer.h"
-#include "tensorflow/compiler/xla/service/device_memory_allocator.h"
 #include "tensorflow/compiler/xla/service/stream_pool.h"
 #include "tensorflow/compiler/xla/service/transfer_manager.h"
 #include "tensorflow/compiler/xla/statusor.h"
@@ -35,6 +34,7 @@ limitations under the License.
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/stream_executor_no_cuda.h"
 #include "tensorflow/core/platform/thread_annotations.h"
+#include "tensorflow/stream_executor/device_memory_allocator.h"
 
 namespace Eigen {
 struct ThreadPoolDevice;
@@ -88,8 +88,11 @@ class Backend {
   // Accessors for the various objects.
   se::Platform* platform() const { return platform_; }
   Compiler* compiler() const { return compiler_; }
-  DeviceMemoryAllocator* memory_allocator() const {
+  se::DeviceMemoryAllocator* memory_allocator() const {
     return memory_allocator_.get();
+  }
+  std::shared_ptr<se::DeviceMemoryAllocator> shared_memory_allocator() const {
+    return memory_allocator_;
   }
   TransferManager* transfer_manager() const { return transfer_manager_; }
   ComputationPlacer* computation_placer() const { return computation_placer_; }
@@ -176,10 +179,13 @@ class Backend {
 
   // Mapping from stream executor to stream pools, used by `BorrowStream` above.
   absl::flat_hash_map<se::StreamExecutor*, std::unique_ptr<StreamPool>>
-      stream_pools_ GUARDED_BY(mu_);
+      stream_pools_ TF_GUARDED_BY(mu_);
 
   // The default memory allocator to use.
-  std::unique_ptr<StreamExecutorMemoryAllocator> memory_allocator_;
+  // This must be a shared_ptr, as this is passed all the way down to the
+  // cluster compilation. This allows asynchronous compilation to hold a
+  // referecence until the compilation is finished.
+  std::shared_ptr<se::StreamExecutorMemoryAllocator> memory_allocator_;
 
   // For the CPU backend, an Eigen threadpool device for use by Eigen code.
   struct IntraOpThreadPool;

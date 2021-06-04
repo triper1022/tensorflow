@@ -27,7 +27,8 @@ namespace tensorflow {
 // `bit_generator` and converted to the requested data type and range. This
 // routine requires 2 32-bit integer seeds and currently only supports 'shape's
 // of type F32, S32 and S64.
-xla::XlaOp StatelessRngUniform(xla::XlaOp seeds, const xla::Shape& shape,
+xla::XlaOp StatelessRngUniform(absl::string_view device_type_string,
+                               xla::XlaOp seeds, const xla::Shape& shape,
                                xla::XlaOp minval, xla::XlaOp maxval);
 
 // Converts to bfloat16 if `dtype` equals DT_BFLOAT16, no-op otherwise.
@@ -35,6 +36,9 @@ xla::XlaOp StatelessRngUniform(xla::XlaOp seeds, const xla::Shape& shape,
 // converted to "maxval" which is out of range ["minval", "maxval"). In
 // addition, the distribution near the limit is not uniform.
 xla::XlaOp MaybeConvertF32ToBF16(xla::XlaOp input, DataType dtype);
+
+// Combines two signed 32-bit seeds into a single unsigned 64 bit seed.
+xla::XlaOp GetU64FromS32Seeds(xla::XlaOp seed0, xla::XlaOp seed1);
 
 }  // namespace tensorflow
 

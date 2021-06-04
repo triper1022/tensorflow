@@ -36,15 +36,7 @@ VERSION_H = "%s/core/public/version.h" % TF_SRC_DIR
 SETUP_PY = "%s/tools/pip_package/setup.py" % TF_SRC_DIR
 README_MD = "./README.md"
 TENSORFLOW_BZL = "%s/tensorflow.bzl" % TF_SRC_DIR
-DEVEL_DOCKERFILE = "%s/tools/docker/Dockerfile.devel" % TF_SRC_DIR
-GPU_DEVEL_DOCKERFILE = "%s/tools/docker/Dockerfile.devel-gpu" % TF_SRC_DIR
-CPU_MKL_DEVEL_DOCKERFILE = "%s/tools/docker/Dockerfile.devel-mkl" % TF_SRC_DIR
-RELEVANT_FILES = [TF_SRC_DIR,
-                  VERSION_H,
-                  SETUP_PY,
-                  README_MD,
-                  DEVEL_DOCKERFILE,
-                  GPU_DEVEL_DOCKERFILE]
+RELEVANT_FILES = [TF_SRC_DIR, VERSION_H, SETUP_PY, README_MD]
 
 # Version type parameters.
 NIGHTLY_VERSION = 1
@@ -238,24 +230,6 @@ def major_minor_change(old_version, new_version):
   return False
 
 
-def update_dockerfiles(old_version, new_version):
-  """Update dockerfiles if there was a major change."""
-  if major_minor_change(old_version, new_version):
-    old_r_major_minor = "r%s.%s" % (old_version.major, old_version.minor)
-    r_major_minor = "r%s.%s" % (new_version.major, new_version.minor)
-
-    print("Detected Major.Minor change.")
-    print("Updating pattern %s to %s in additional files"
-          % (old_r_major_minor, r_major_minor))
-
-    # Update dockerfiles
-    replace_string_in_line(old_r_major_minor, r_major_minor, DEVEL_DOCKERFILE)
-    replace_string_in_line(old_r_major_minor, r_major_minor,
-                           GPU_DEVEL_DOCKERFILE)
-    replace_string_in_line(old_r_major_minor, r_major_minor,
-                           CPU_MKL_DEVEL_DOCKERFILE)
-
-
 def check_for_lingering_string(lingering_string):
   """Check for given lingering strings."""
   formatted_string = lingering_string.replace(".", r"\.")
@@ -320,10 +294,8 @@ def main():
       new_version = Version.parse_from_string(args.version, NIGHTLY_VERSION)
       new_version.set_identifier_string("-dev" + time.strftime("%Y%m%d"))
     else:
-      # Dev minor version is one ahead of official.
-      nightly_minor_ver = int(old_version.minor) + 1
       new_version = Version(old_version.major,
-                            str(nightly_minor_ver),
+                            str(old_version.minor),
                             old_version.patch,
                             "-dev" + time.strftime("%Y%m%d"),
                             NIGHTLY_VERSION)
@@ -333,7 +305,6 @@ def main():
   update_version_h(old_version, new_version)
   update_setup_dot_py(old_version, new_version)
   update_readme(old_version, new_version)
-  update_dockerfiles(old_version, new_version)
   update_tensorflow_bzl(old_version, new_version)
 
   # Print transition details.

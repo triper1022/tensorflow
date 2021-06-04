@@ -21,20 +21,24 @@ from absl.testing import parameterized
 import numpy as np
 
 from tensorflow.python.data.experimental.ops import take_while_ops
+from tensorflow.python.data.kernel_tests import checkpoint_test_base
 from tensorflow.python.data.kernel_tests import test_base
 from tensorflow.python.data.ops import dataset_ops
+from tensorflow.python.framework import combinations
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import errors
-from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.platform import test
 
 
-@test_util.run_all_in_graph_and_eager_modes
 class TakeWhileTest(test_base.DatasetTestBase, parameterized.TestCase):
 
-  @parameterized.parameters((14, 2), (15, 2), (100, 3))
+  @combinations.generate(
+      combinations.times(
+          test_base.default_test_combinations(),
+          combinations.combine(num_elements=[14, 15], window_size=[2]) +
+          combinations.combine(num_elements=[100], window_size=[3])))
   def testTakeWhileDataset(self, num_elements, window_size):
 
     def _predicate_func(elem):
@@ -49,19 +53,22 @@ class TakeWhileTest(test_base.DatasetTestBase, parameterized.TestCase):
     expected_num_elements = int(num_elements / window_size) * window_size
     self.assertDatasetProduces(dataset, np.arange(expected_num_elements))
 
-  @parameterized.parameters((10, 2, False), (16, 7, False), (100, 99, False),
-                            (100, 101, True), (0, 1, True))
-  def testTakeWhileDatasetRange(self, num_elements, upper_bound, out_of_bounds):
+  @combinations.generate(
+      combinations.times(
+          test_base.default_test_combinations(),
+          combinations.combine(num_elements=[10], upper_bound=[2]) +
+          combinations.combine(num_elements=[16], upper_bound=[7]) +
+          combinations.combine(num_elements=[100], upper_bound=[99]) +
+          combinations.combine(num_elements=[100], upper_bound=[101]) +
+          combinations.combine(num_elements=[0], upper_bound=[1])))
+  def testTakeWhileDatasetRange(self, num_elements, upper_bound):
     dataset = dataset_ops.Dataset.range(num_elements).apply(
         take_while_ops.take_while(lambda x: x < upper_bound))
 
-    if out_of_bounds:
-      with self.assertRaises(errors.OutOfRangeError):
-        self.assertDatasetProduces(dataset, np.arange(upper_bound))
+    self.assertDatasetProduces(dataset,
+                               np.arange(min(num_elements, upper_bound)))
 
-    else:
-      self.assertDatasetProduces(dataset, np.arange(upper_bound))
-
+  @combinations.generate(test_base.default_test_combinations())
   def testTakeWhileDatasetString(self):
 
     def not_equal(string):
@@ -79,7 +86,13 @@ class TakeWhileTest(test_base.DatasetTestBase, parameterized.TestCase):
     with self.assertRaises(errors.OutOfRangeError):
       self.assertEqual(b"test", self.evaluate(next_element()))
 
-  @parameterized.parameters((5, 3), (10, 0), (100, 5), (8, 7))
+  @combinations.generate(
+      combinations.times(
+          test_base.default_test_combinations(),
+          combinations.combine(size=[5], index=[3]) +
+          combinations.combine(size=[10], index=[0]) +
+          combinations.combine(size=[100], index=[5]) +
+          combinations.combine(size=[8], index=[7])))
   def testTakewhileDatasetShortCircuit(self, size, index):
 
     def _predicate_func(data_elem):
@@ -98,10 +111,27 @@ class TakeWhileTest(test_base.DatasetTestBase, parameterized.TestCase):
     with self.assertRaises(errors.OutOfRangeError):
       self.evaluate(next_element())
 
+  @combinations.generate(test_base.default_test_combinations())
   def testTakeWhileDatasetWithRepeat(self):
     dataset = dataset_ops.Dataset.range(10).apply(
         take_while_ops.take_while(lambda x: x < 2)).repeat(5)
     self.assertDatasetProduces(dataset, np.tile([0, 1], 5))
+
+
+class TakeWhileCheckpointTest(checkpoint_test_base.CheckpointTestBase,
+                              parameterized.TestCase):
+
+  def _build_dataset(self, num_elements, upper_bound):
+    return dataset_ops.Dataset.range(num_elements).apply(
+        take_while_ops.take_while(lambda x: x < upper_bound))
+
+  @combinations.generate(
+      combinations.times(
+          test_base.default_test_combinations(),
+          combinations.combine(num_elements=[10, 23], upper_bound=[10, 23])))
+  def testCore(self, num_elements, upper_bound):
+    self.run_core_tests(lambda: self._build_dataset(num_elements, upper_bound),
+                        min(num_elements, upper_bound))
 
 
 if __name__ == "__main__":

@@ -28,12 +28,14 @@ XlaCompiledCpuFunction::XlaCompiledCpuFunction(const StaticData& static_data,
       buffer_infos_(static_data.buffer_infos_),
       arg_index_table_(static_data.arg_index_table_),
       num_args_(static_data.num_args_),
+      num_variables_(static_data.num_variables_),
       arg_names_(static_data.arg_names_),
+      variable_names_(static_data.variable_names_),
       result_names_(static_data.result_names_),
       program_shape_(static_data.program_shape_),
       hlo_profile_printer_data_(static_data.hlo_profile_printer_data_) {
   bool allocate_entry_params =
-      alloc_mode == AllocMode::ARGS_RESULTS_PROFILES_AND_TEMPS;
+      alloc_mode == AllocMode::ARGS_VARIABLES_RESULTS_PROFILES_AND_TEMPS;
   // Allocate arg and temp buffers.
   alloc_buffer_table_ = xla::cpu_function_runtime::MallocContiguousBuffers(
       static_data.buffer_infos_, static_data.num_buffers_,
@@ -63,6 +65,8 @@ XlaCompiledCpuFunction::~XlaCompiledCpuFunction() {
 
 namespace {
 
+constexpr int kNotFound = -1;
+
 // Linear search through `names` looking for a match with `name`. Returns -1 if
 // the name isn't found, or is empty.
 //
@@ -72,7 +76,6 @@ int LookupNameIndex(const string& name, const char** names) {
   // for AOT try the setting the tfcompile --gen_name_to_index flag.
   assert(names != nullptr);
 
-  constexpr int kNotFound = -1;
   if (name.empty()) {
     return kNotFound;
   }
@@ -88,6 +91,14 @@ int LookupNameIndex(const string& name, const char** names) {
 
 int XlaCompiledCpuFunction::LookupArgIndex(const string& name) const {
   return LookupNameIndex(name, arg_names_);
+}
+
+int XlaCompiledCpuFunction::LookupVariableIndex(const string& name) const {
+  int index = LookupNameIndex(name, variable_names_);
+  if (index == kNotFound) {
+    return kNotFound;
+  }
+  return num_args_ - num_variables_ + index;
 }
 
 int XlaCompiledCpuFunction::LookupResultIndex(const string& name) const {

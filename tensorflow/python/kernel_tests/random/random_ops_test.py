@@ -230,7 +230,7 @@ class TruncatedNormalTest(test.TestCase):
 
   @test_util.run_deprecated_v1
   def testLargeShape(self):
-    with self.session(use_gpu=True):
+    with self.session():
       v = variables.Variable(
           array_ops.zeros(dtype=dtypes.float32, shape=[2**33, 1]))
       n = random_ops.truncated_normal(v.shape)
@@ -238,7 +238,7 @@ class TruncatedNormalTest(test.TestCase):
 
   @test_util.run_deprecated_v1
   def testNoCSE(self):
-    with self.session(use_gpu=True):
+    with self.session():
       shape = [2, 3, 4]
       rnd1 = random_ops.truncated_normal(shape, 0.0, 1.0, dtypes.float32)
       rnd2 = random_ops.truncated_normal(shape, 0.0, 1.0, dtypes.float32)
@@ -257,7 +257,8 @@ class TruncatedNormalTest(test.TestCase):
       self.assertAllEqual(rnd1, rnd2)
 
 
-@test_util.disable_all_xla("This never passed on XLA")
+@test_util.for_all_test_methods(test_util.disable_xla,
+                                "This never passed on XLA")
 class RandomUniformTest(RandomOpTestCommon):
 
   def _Sampler(self, num, minv, maxv, dtype, use_gpu, seed=None):
@@ -302,12 +303,12 @@ class RandomUniformTest(RandomOpTestCommon):
   @test_util.run_deprecated_v1
   def testUniformIntsWithInvalidShape(self):
     for dtype in dtypes.int32, dtypes.int64:
-      with self.assertRaisesRegexp(
-          ValueError, "Shape must be rank 0 but is rank 1"):
+      with self.assertRaisesRegex(
+          ValueError, "minval must be a scalar; got a tensor of shape"):
         random_ops.random_uniform(
             [1000], minval=[1, 2], maxval=3, dtype=dtype)
-      with self.assertRaisesRegexp(
-          ValueError, "Shape must be rank 0 but is rank 1"):
+      with self.assertRaisesRegex(
+          ValueError, "maxval must be a scalar; got a tensor of shape"):
         random_ops.random_uniform(
             [1000], minval=1, maxval=[2, 3], dtype=dtype)
 
@@ -370,7 +371,7 @@ class RandomUniformTest(RandomOpTestCommon):
   def testNoCSE(self):
     shape = [2, 3, 4]
     for dtype in dtypes.float16, dtypes.float32, dtypes.int32:
-      with self.session(use_gpu=True):
+      with self.session():
         rnd1 = random_ops.random_uniform(shape, 0, 17, dtype=dtype)
         rnd2 = random_ops.random_uniform(shape, 0, 17, dtype=dtype)
         diff = (rnd2 - rnd1).eval()

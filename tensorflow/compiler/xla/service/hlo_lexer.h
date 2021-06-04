@@ -61,17 +61,19 @@ enum class TokKind {
   kw_false,
   kw_maximal,
   kw_replicated,
+  kw_manual,
+  kw_last_tile_dim_replicate,
   kw_nan,
   kw_inf,
-  kw_sparse,
 
+  kNegNan,  // -nan
   kNegInf,  // -inf
 
   // Typed tokens.
   kPrimitiveType,  // F32, PRED, etc.
   kName,           // %foo
   kAttributeName,  // dimensions=
-  kDimLabels,      // [0-9bf]{2,}_[0-9io]{2,}->[0-9bf]{2,}
+  kDimLabels,      // [0-9bf?]{2,}_[0-9io?]{2,}->[0-9bf?]{2,}
   kDxD,            // [0-9]+(x[0-9]+)+
   kPad,            // [0-9]+_[0-9]+(_[0-9]+)?(x[0-9]+_[0-9]+(_[0-9]+)?)*
   kIdent,          // other identifiers
@@ -148,8 +150,6 @@ class HloLexer {
   // or it's out of the range of the current buffer.
   absl::string_view StringPieceFromPointers(const char* begin,
                                             const char* end) const;
-  tensorflow::RegexpStringPiece RegexpStringPieceFromPointers(
-      const char* begin, const char* end) const;
 
   // Returns true if the given ptr is dereferenceable within the range of the
   // current buffer.
